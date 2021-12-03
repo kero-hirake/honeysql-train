@@ -1,6 +1,8 @@
 (ns honeysql-practice.core
   (:require [honey.sql :as sql]
-            [honey.sql.helpers :refer [select from where insert-into columns values] :as h])
+            [honey.sql.helpers :refer [select from where insert-into columns 
+              values composite update set delete delete-from join truncate
+              union union-all intersect except] :as h])
   (:gen-class))
 
 ; SQLクエリを能わすマップで構築
@@ -155,7 +157,6 @@
                            :where [:= :name "user"]}}]}
       (sql/format)))
 
-
 (-> (select :*)
     (from :foo)
     (where [:in :foo.a (-> (select :a)
@@ -169,3 +170,78 @@
      :where [:in :foo.a {:select [:a], :from [:bar]}]}
     (sql/format))
 
+;; Composite types
+; 複合型をサポート
+(-> (insert-into :comp_table)
+    (columns :namd :comp_column)
+    (values
+     [["small" (composite 1 "inch")]
+      ["large" (composite 10 "feet")]])
+    (sql/format))
+; => ["
+;INSERT INTO comp_table
+;(name, comp_column)
+;VALUES (?, (?, ?)), (?, (?, ?))"
+;     "small" 1 "inch" "large" 10 "feet"]
+
+; DSL の場合
+(-> {:insert-into [:comp_table]
+     :columns [:name :comp_column]
+     :values [["small" [:composite 1 "inch"]]
+              ["large" [:composite 10 "feet"]]]}
+    (sql/format))
+
+;; Updates
+(-> (update :films)
+    (set {:kind "dramatic"
+          :watched [:+ :watched 1]})
+    (where [:= :kind "drama"])
+    (sql/format))
+; 複合更新ステートメント（fromまたはjoinを使用）を作成する場合、
+; SETを表示する場所が、データベースごとに構文がわずかに異なることに注意
+
+;; Delets
+(-> (delete-from :films)
+    (where [:<> :kind "mussical"])
+    (sql/format))
+; DSLの場合
+(-> {:delete-from :films
+     :where [:<> :kind "musical"]}
+    (sql/format))
+
+;複数のテーブルから削除がサポートされている場合
+(-> (delete [:films :directors])
+    (from :films)
+    (join :directors [:= :films.director_id :directors.id])
+    (where [:<> :kind "musical"])
+    (sql/format))
+;=> ["
+;DELETE films, directors
+;FROM films
+;INNER JOIN directors ON films.director_id = directors.id
+;WHERE kind <> ?"
+;    "musical"]
+
+; DSL
+(-> {:delete [:films :directors]
+     :from [:films]
+     :join [:directors [:= :films.director_id :directors.id]]
+     :where [:<> :kind "musical"]}
+    (sql/format {:pretty true}))
+
+; テーブルからすべてを削除する場合は、truncateを使用できます。
+(-> (truncate :films)
+    (sql/format) ) 
+;=> ["TRUNCATE films"]
+; DSL
+(-> {:truncate :films}
+    (sql/format))
+
+;; Set operations
+;：union ：union-all ：intersect :except も利用可能
+(sql/format (union (-> (select :*) (from :foo))
+                   (-> (select :*) (from :bar))))
+;=> ["SELECT * FROM foo UNION SELECT * FROM bar"]
+; DSL
+(sql/format {:union [{:select :* :from :foo}
+                     {:select :* :from :bar}]})
