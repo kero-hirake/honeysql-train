@@ -200,7 +200,7 @@
 ; 複合更新ステートメント（fromまたはjoinを使用）を作成する場合、
 ; SETを表示する場所が、データベースごとに構文がわずかに異なることに注意
 
-;; Delets
+;; Deletes
 (-> (delete-from :films)
     (where [:<> :kind "mussical"])
     (sql/format))
@@ -245,3 +245,144 @@
 ; DSL
 (sql/format {:union [{:select :* :from :foo}
                      {:select :* :from :bar}]})
+
+;; Functions
+; ％で始まるキーワードは、SQL関数呼び出しとして解釈されます
+(-> (select :%count.*) (from :foo) sql/format)
+(-> (select :%max.id) (from :foo) sql/format)
+;通常の関数呼び出しは[]で示されるが、エイリアスペアも[]で示されるため、%の方が便利
+(-> (select [[:count :*]]) (from :foo) sql/format)
+(-> {:select [[[:max :id]]], :from [:foo] } sql/format)
+
+;; Bindable parameters
+;？で始まるキーワードは、バインド可能なパラメータとして解釈されます
+(-> (select :id)
+    (from :foo)
+    (where[:= :a :?baz])
+    (sql/format {:params {:baz "BAZ"}}))
+;=> ["SELECT id FROM foo WHERE a = ?" "BAZ"]
+(-> {:select [:id] :from [:foo] :where [:= :a :?baz]}
+    (sql/format {:params {:baz "BAZ"}}))
+
+;Miscellaneous
+; :raw構文を使用すると、SQLフラグメントをHoneySQL式に直接埋め込むことができます。
+; :inline構文は、Clojure値をSQL値に変換してから、その文字列を埋め込みます。
+; :param構文は、フォーマットする:params引数を介して値が提供される名前付きパラメーターを識別します。
+; :lift構文は、DSLの一部としてのClojureデータ構造の解釈を防ぎ、代わりにそのような値をパラメーターに変換します
+; :nest構文では、引数をSQL式としてフォーマットした後、追加の括弧のセットが引数の周りにラップされます。
+(def call-qualify-map
+  (-> (select [[:foo :bar]] [[:raw "@var := foo.bar"]])
+      (from :foo)
+      (where [:= :a [:param :baz]] [:= :b [:inline 42]])))
+;=>{:where [:and [:= :a [:param :baz]] [:= :b [:inline 42]]]
+;  :from (:foo)
+;  :select [[[:foo :bar]] [[:raw "@var := foo.bar"]]]}
+(sql/format call-qualify-map {:params {:baz "BAZ"}})
+;=> ["SELECT FOO(bar), @var := foo.bar 
+;    FROM foo 
+;    WHERE (a = ?) AND (b = 42)" "BAZ"]
+(-> (select :*)
+    (from :foo)
+    (where [:< :expired_at [:raw ["now() - '" 5 " seconds'"]]])
+    (sql/format))
+;=> ["SELECT * FROM foo WHERE expired_at < now() - '5 seconds'"]
+(-> (select :*)
+    (from :foo)
+    (where [:< :expired_at [:raw ["now() - '" [:lift 5] " seconds'"]]])
+    (sql/format))
+;=> ["SELECT * FROM foo WHERE expired_at < now() - '? seconds'" 5]
+(-> (select :*)
+    (from :foo)
+    (where [:< :expired_at [:raw ["now() - '" [:param :t] " seconds'"]]])
+    (sql/format {:params {:t 5}}))
+;=> ["SELECT * FROM foo WHERE expired_at < now() - '? seconds'" 5]
+(-> (select :*)
+    (from :foo)
+    (where [:< :expired_at [:raw ["now() - " [:inline (str 5 " seconds")]]]])
+    (sql/format))
+;=> ["SELECT * FROM foo WHERE expired_at < now() - '5 seconds'"]
+
+;PostGIS 
+;PostgreSQLデータベースで地理空間情報を扱うための拡張
+(-> (insert-into :sample)
+    (values [{:location [:ST_SetSRID
+                         [:ST_MakePoint 0.291 32.621]
+                         [:cast 4325 :integer]]}])
+    (sql/format {:pretty true}))
+
+;; 
+; 識別子をクオートするには、:quoted trueオプションを渡してフォーマットすると、
+; 選択した方言に従って引用されます。
+; formatで方言をオーバーライドする場合、：dialectオプションを渡すことにより、
+; 識別子は自動的に引用符で囲まれます。
+; (-> (select :foo.a)
+;     (from :foo)
+;     (where [:= :foo.a "baz"])
+;     (sql/format {:dialect :mysql}))
+; => ["SELECT `foo`.`a` FROM `foo` WHERE `foo`.`a` = ?" "baz"]
+
+;Locking
+;ANSI / PostgreSQL / SQLServerは、次のようにFOR句を介した選択のロックをサポートします。
+; (-> (select :foo.a)
+;     (from :foo)
+;     (where [:= :foo.a "baz"])
+;     (for :update)
+;     (sql/format))
+; => ["SELECT foo.a FROM foo WHERE foo.a = ? FOR UPDATE" "baz"]
+
+; (sql/format {:select [:*] :from :foo
+;              :where [:= :name [:inline "Jones"]]
+;              :lock [:in-share-mode]}
+;             {:dialect :mysql :quoted false})
+; => ["SELECT * FROM foo WHERE name = 'Jones' LOCK IN SHARE MODE"]
+
+;;
+;ベクトルの最初の要素として表示されるキーワード（またはシンボル）は、
+;演算子または「特別な構文」として宣言されていない限り、ジェネリック関数として扱われます。
+;ハッシュマップでキーとして表示されるキーワード（または記号）は、SQL句として扱われ
+;組み込みであるか、新しい句として登録されている必要があります。
+
+;データベースが演算子として<=>をサポートしている場合は、
+;register-op！を使用してHoneySQLに通知できます。
+(-> (select :a) (where [:<=> "food" :a "fool"]) sql/format)
+;=>["SELECT a WHERE <=>(?, a, ?)" "food" "fool"]
+(sql/register-op! :<=>)
+(-> (select :a) (where [:<=> "food" :a "fool"]) sql/format)
+;=> ["SELECT a WHERE a <=> ?" "foo"] ?
+(sql/register-op! :<=> :variadic true)
+(-> (select :a) (where [:<=> "food" :a "fool"]) sql/format)
+;=> ["SELECT a WHERE ? <=> a <=> ?" "food" "fool"] ?
+
+;演算子にnil句を無視させたい場合
+(sql/register-op! :<=> :ignore-nil true)
+
+;または、データベースがa BETWIXT b AND cのような構文をサポートしている場合は、
+;register-fnを使用できます。
+(sql/register-fn! :betwixt
+                  (fn [op [a b c]]
+                    (let [[sql-a & params-a] (sql/format-expr a)
+                          [sql-b & params-b] (sql/format-expr b)
+                          [sql-c & params-c] (sql/format-expr c)]
+                      (-> [(str sql-a " " (sql/sql-kw op) " "
+                                sql-b " AND " sql-c)]
+                          (c/into params-a)
+                          (c/into params-b)
+                          (c/into params-c)))))
+;; example usage:
+(-> (select :a) (where [:betwixt :a 1 10]) sql/format)
+;=> ["SELECT a WHERE a BETWIXT ? AND ?" 1 10]
+
+;SQL句を登録することもできます
+(sql/register-clause! :foobar
+                      (fn [clause x]
+                        (let [[sql & params]
+                              (if (ident? x)
+                                (sql/format-expr x)
+                                (sql/format-dsl x))]
+                          (c/into [(str (sql/sql-kw clause) " " sql)] params)))
+                      :from) ; SELECT ... FOOBAR ... FROM ...
+;; example usage:
+(sql/format {:select [:a :b] :foobar :baz})
+;=> ["SELECT a, b FOOBAR baz"]
+(sql/format {:select [:a :b] :foobar {:where [:= :id 1]}})
+;=> ["SELECT a, b FOOBAR WHERE id = ?" 1]
